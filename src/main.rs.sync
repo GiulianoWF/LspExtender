@@ -1,0 +1,91 @@
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::process::{Command, Stdio};
+use std::{thread, time};
+
+const BUFFER_SIZE: usize = 4096;
+
+fn log_char(character: char, log_filename: &str)  {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_filename)
+        .expect("Failed to open log file");
+    writeln!(file, "{}", character).expect("Failed to write char to log file");
+}
+
+fn log_message(message: &str, log_filename: &str) {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_filename)
+        .expect("Failed to open log file");
+    writeln!(file, "{}", message).expect("Failed to write message to log file");
+}
+
+fn communicate_with_clangd(content: &str, to_clangd: &mut std::process::ChildStdin, from_clangd: &mut BufReader<std::process::ChildStdout>, log_filename: &str) {
+    to_clangd.write_all(content.as_bytes()).expect("Failed to write to clangd");
+    log_message(&format!("Sent to clangd: {}", content), log_filename);
+
+    match read_message(from_clangd) {
+        Ok(response) => {
+            println!("{}", response);
+            log_message(&format!("Received from clangd: {}", response), log_filename);
+        },
+        Err(e) => eprintln!("Error reading message from clangd: {}", e),
+    }
+}
+
+fn read_message(input_stream: &mut impl BufRead) -> io::Result<String> {
+    let mut header_line = String::new();
+    if input_stream.read_line(&mut header_line)? > 0 {
+        let content_length: usize = header_line.trim()
+            .split(':')
+            .nth(1)
+            .expect("Content-Length header not found")
+            .trim()
+            .parse()
+            .expect("Failed to parse content length");
+
+        let mut separator = vec![0; 2]; 
+        input_stream.read_exact(&mut separator);
+        let separator = String::from_utf8(separator)
+            .expect("Failed to read separator");
+        header_line.push_str(&separator);
+
+        let mut content = vec![0; content_length];
+        input_stream.read_exact(&mut content)?;
+        let content = String::from_utf8(content)
+            .expect("Failed to convert content to String");
+        header_line.push_str(&content);
+
+        return Ok(header_line);
+    }
+    Ok(String::new())
+}
+
+fn main() {
+        //log_message(&header_line, "/tmp/adapter_log.txt");
+    let log_filename = "/tmp/adapter_log.txt";
+
+    let mut clangd = Command::new("clangd-15")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to start clangd");
+
+    let mut to_clangd = clangd.stdin.take().expect("Failed to open stdin to clangd");
+    let mut from_clangd = BufReader::new(clangd.stdout.take().expect("Failed to open stdout from clangd"));
+
+    let mut input = BufReader::new(io::stdin());
+
+    for _ in 0..3 {
+        let message = read_message(&mut input).unwrap_or_default();
+        communicate_with_clangd(&message, &mut to_clangd, &mut from_clangd, log_filename);
+        log_message("hey", "/tmp/adapter_log.txt");
+    }
+
+    clangd.wait().expect("Failed to wait on clangd");
+}
+

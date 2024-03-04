@@ -1,0 +1,305 @@
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt };
+use std::process::Stdio;
+use tokio::process::{Command, ChildStdin, ChildStdout};
+use tokio::task;
+use std::io::BufRead;
+use std::fs::OpenOptions;
+use std::io::Write;
+use tokio::io::AsyncBufReadExt;
+
+async fn _forward_input_to_clangd_old(mut stdin: tokio::io::Stdin, mut clangd_stdin: ChildStdin) {
+    let mut buffer = [0; 1]; // Buffer to read one char at a time
+    while let Ok(n) = stdin.read(&mut buffer).await {
+        if n == 0 {
+            break; // EOF
+        }
+        if clangd_stdin.write_all(&buffer[..n]).await.is_err() {
+            eprintln!("Failed to write to clangd stdin");
+            break;
+        }
+    }
+}
+
+async fn _forward_clangd_output_to_stdout_old(mut clangd_stdout: ChildStdout) {
+    let mut buffer = [0; 1]; // Buffer to read one char at a time
+    while let Ok(n) = clangd_stdout.read(&mut buffer).await {
+        if n == 0 {
+            break; // EOF
+        }
+        if io::stdout().write_all(&buffer[..n]).await.is_err() {
+            eprintln!("Failed to write to stdout");
+            break;
+        }
+    }
+}
+
+//async fn forward_input_to_clangd(mut stdin: Stdin, mut clangd_stdin: ChildStdin) -> io::Result<()> {
+//    let stdin_reader = BufReader::new(stdin);
+//
+//    loop {
+//        let message = task::spawn_blocking(move || read_message(&mut stdin_reader)).await??;
+//        if message.is_empty() {
+//            break; // Assuming read_message returns an empty string on EOF or similar
+//        }
+//        if clangd_stdin.write_all(message.as_bytes()).await.is_err() {
+//            eprintln!("Failed to write to clangd stdin");
+//            break;
+//        }
+//    }
+//    Ok(())
+//}
+//
+//async fn forward_clangd_output_to_stdout(mut clangd_stdout: ChildStdout) -> io::Result<()> {
+//    let stdout_reader = BufReader::new(clangd_stdout);
+//
+//    loop {
+//        let message = task::spawn_blocking(move || read_message(&mut stdout_reader)).await??;
+//        if message.is_empty() {
+//            break; // Assuming read_message returns an empty string on EOF or similar
+//        }
+//        if io::stdout().write_all(message.as_bytes()).await.is_err() {
+//            eprintln!("Failed to write to stdout");
+//            break;
+//        }
+//    }
+//    Ok(())
+//}
+async fn read_message_async(input_stream: &mut ChildStdout) -> io::Result<String> {
+    let mut reader = tokio::io::BufReader::new(input_stream);
+    let mut buffer = [0; 1]; // Buffer to read one char at a time
+    // Initial log to confirm the function was called
+    log_message("read_message_async called");
+
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => {
+                // End of stream (EOF)
+                let message = "Reached EOF";
+                //log_message(&message);
+            },
+            Ok(n) => {
+                // Successfully read `n` bytes
+                let message = format!("Read {}", n);
+                log_message(&message);
+            },
+            Err(e) => {
+                // An error occurred
+                let message = "error";
+                log_message(&message);
+            }
+            //Ok(_) => {
+            //    log_bytes_to_file(&buffer);            // Convert the byte to char and log it
+            //    //if let Ok(log_char) = std::str::from_utf8(&buffer) {
+            //    //    log_char_to_file(log_char).expect("Failed to log char");
+            //    //}
+            //},
+            //Err(e) => {
+            //    // Log any error encountered
+            //    log_message(&format!("Error reading char: {}", e));
+            //    return Err(e);
+            //}
+        }
+    }
+
+    // Log completion of the loop
+    log_message("read_message_async completed");
+
+    Ok(String::new())
+}
+
+fn log_char_to_file(log_char: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open("/tmp/adapter_log.txt")?;
+    writeln!(file, "{}", log_char)?;
+    Ok(())
+}
+//async fn read_message_async(input_stream: &mut tokio::process::ChildStdout) -> io::Result<String> {
+//    let mut reader = tokio::io::BufReader::new(input_stream);
+//    let mut header_line = String::new();
+//
+//    let message = format!("reading");
+//
+//    log_message(&message);
+//    // Read the header line
+//    if reader.read_line(&mut header_line).await? == 0 {
+//        // Handle EOF or error
+//        return Ok(String::new());
+//    }
+//
+//    // Parse the content length (assuming header_line contains it)
+//    let content_length: usize = header_line.trim()
+//        .split(':')
+//        .nth(1)
+//        .expect("Content-Length header not found")
+//        .trim()
+//        .parse()
+//        .expect("Failed to parse content length");
+//
+//    // Assuming a "\r\n" separator after the header, consume it
+//    let mut separator = vec![0; 2];
+//    reader.read_exact(&mut separator).await.expect("Failed to read separator");
+//
+//    let message = format!("content_leng {}", content_length);
+//
+//    log_message(&message);
+//
+//    // Read the content based on the content length
+//    let mut content = vec![0; content_length];
+//    reader.read_exact(&mut content).await?;
+//    let content = String::from_utf8(content).expect("Failed to convert content to String");
+//
+//    // Combine header and content
+//    let message = format!("{}\r\n{}", header_line, content);
+//
+//    //log_message(&message);
+//    Ok(message)
+//}
+
+fn read_message(input_stream: &mut impl BufRead) -> io::Result<String> {
+    let mut header_line = String::new();
+    if input_stream.read_line(&mut header_line)? > 0 {
+        let content_length: usize = header_line.trim()
+            .split(':')
+            .nth(1)
+            .expect("Content-Length header not found")
+            .trim()
+            .parse()
+            .expect("Failed to parse content length");
+
+        let mut separator = vec![0; 2]; 
+        let _ = input_stream.read_exact(&mut separator);
+        let separator = String::from_utf8(separator)
+            .expect("Failed to read separator");
+        //header_line.push_str(&separator);
+
+        let mut content = vec![0; content_length];
+        input_stream.read_exact(&mut content)?;
+        let content = String::from_utf8(content)
+            .expect("Failed to convert content to String");
+        //header_line.push_str(&content);
+        
+        let lsp_message = format!(
+            "{}\r\n{}",
+            header_line, content
+        );
+
+       // log_message(&lsp_message);
+        
+        return Ok(lsp_message);
+    }
+    Ok(String::new())
+}
+
+fn log_message(message: &str) {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/adapter_log.txt")
+        .expect("Failed to open log file");
+    writeln!(file, "{}", message).expect("Failed to write message to log file");
+}
+
+//#[tokio::main]
+//async fn main() {
+//    let mut clangd = Command::new("clangd-15")
+//        .stdin(std::process::Stdio::piped())
+//        .stdout(std::process::Stdio::piped())
+//        .spawn()
+//        .expect("Failed to start clangd-15");
+//
+//    let clangd_stdin = clangd.stdin.take().expect("Failed to open clangd stdin");
+//    let clangd_stdout = clangd.stdout.take().expect("Failed to open clangd stdout");
+//
+//    let stdin = io::stdin();
+//
+//    // Forwarding input to clangd
+//    let forward_input_handle = task::spawn(async move {
+//        forward_input_to_clangd(stdin, clangd_stdin).await;
+//    });
+//
+//    // Forwarding clangd output to stdout
+//    let forward_output_handle = task::spawn(async move {
+//        forward_clangd_output_to_stdout(clangd_stdout).await;
+//    });
+//
+//    // Await both tasks to complete
+//    let _ = tokio::try_join!(forward_input_handle, forward_output_handle);
+//
+//    // Optionally, wait for the clangd process to exit
+//    let _ = clangd.wait().await.expect("clangd process encountered an error");
+//}
+fn log_bytes_to_file(bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open("/tmp/adapter_log.txt")?; // Adjust the file path as needed
+
+    // Write the byte slice directly to the file
+    file.write_all(bytes)?;
+    
+    // Optionally, write a newline or separator
+    file.write_all(b"\n")?;
+
+    Ok(())
+}
+
+
+#[tokio::main]
+async fn main() {
+    //let mut clangd = Command::new("clangd-15")
+    let mut clangd = Command::new("clangd-15")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to start clangd-15");
+
+    let clangd_stdin = clangd.stdin.take().expect("Failed to open clangd stdin");
+    let clangd_stdout = clangd.stdout.take().expect("Failed to open clangd stdout");
+
+    let forward_input_handle = tokio::spawn(async move {
+        task::spawn_blocking(move || {
+            let mut input = std::io::BufReader::new(std::io::stdin());
+            let mut output = clangd_stdin;
+
+            for _ in 0..44 {
+                let message = read_message(&mut input).unwrap_or_default();
+                if message.is_empty() { break; } // Assuming read_message returns an empty string to signal EOF or similar
+                //let _ = output.write_all(message.as_bytes());
+                //let log_message_str = format!("Sent: {}", message.as_bytes());
+                //log_bytes_to_file(&message.as_bytes());
+            }
+        }).await.expect("Failed to forward input to clangd");
+    });
+
+    // Forwarding clangd output to stdout
+    let forward_output_handle = task::spawn(async move {
+        _forward_clangd_output_to_stdout_old(clangd_stdout).await;
+    });
+    //let forward_output_handle = tokio::spawn(async move {
+    //    task::spawn_blocking(move || {
+    //        let mut input = clangd_stdout;
+    //        let mut output = std::io::stdout();
+
+    //        for _ in 0..44 {
+    //            let message = tokio::runtime::Runtime::new().unwrap().block_on(read_message_async(&mut input)).unwrap_or_default();
+    //            //let message = read_message_async(input).await.unwrap_or_default();
+    //            if message.is_empty() { continue; } // Assuming read_message returns an empty string to signal EOF or similar
+    //            let _ = output.write_all(message.as_bytes());
+    //            let log_message_str = format!("received: {}", message);
+    //            //log_message(&log_message_str);
+    //        }
+    //    }).await.expect("Failed to forward input to clangd");
+    //});
+
+    // Await both tasks to complete
+    let _ = tokio::try_join!(forward_input_handle, forward_output_handle);
+
+    // Optionally, wait for the clangd process to exit
+    let _ = clangd.wait().await.expect("clangd process encountered an error");
+}
+
+

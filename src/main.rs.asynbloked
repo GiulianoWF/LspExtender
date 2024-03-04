@@ -1,0 +1,116 @@
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt };
+use std::process::Stdio;
+use tokio::process::{Command, ChildStdin, ChildStdout};
+use tokio::task;
+use std::io::BufRead;
+use std::fs::OpenOptions;
+use std::io::Write;
+use tokio::io::AsyncBufReadExt;
+
+fn log_message(message: &str) {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/adapter_log.txt")
+        .expect("Failed to open log file");
+    writeln!(file, "{}", message).expect("Failed to write message to log file");
+}
+
+fn log_bytes_to_file(bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open("/tmp/adapter_log.txt")?; // Adjust the file path as needed
+
+    // Write the byte slice directly to the file
+    file.write_all(bytes)?;
+    
+    // Optionally, write a newline or separator
+    //file.write_all(b"\n")?;
+
+    Ok(())
+}
+
+fn log_char_to_file(log_char: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open("/tmp/adapter_log.txt")?;
+    writeln!(file, "{}", log_char)?;
+    Ok(())
+}
+
+async fn forward_input_to_clangd(mut stdin: tokio::io::Stdin, mut clangd_stdin: ChildStdin) {
+    while true {
+        //let mut buffer = [0; 1]; // Buffer to read one char at a time
+        let mut buffer = [0u8; 1];
+        while let Ok(n) = stdin.read(&mut buffer).await {
+            let read = &buffer[0..1];
+            //log_bytes_to_file(&read);
+            if n == 0 {
+                continue; // EOF
+            }
+            if clangd_stdin.write_all(&buffer[..n]).await.is_err() {
+                eprintln!("Failed to write to clangd stdin");
+                continue;
+            }
+        }
+        let message = "log";
+       // log_message(&message);
+    }
+}
+
+async fn forward_clangd_output_to_stdout(mut clangd_stdout: ChildStdout) {
+    let mut buffer = [0; 1]; // Buffer to read one char at a time
+    while let Ok(n) = clangd_stdout.read(&mut buffer).await {
+        if n == 0 {
+            continue; // EOF
+        }
+            let read = &buffer[0..1];
+            log_bytes_to_file(&read);
+        if io::stdout().write_all(&buffer[..n]).await.is_err() {
+            eprintln!("Failed to write to stdout");
+            continue;
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let mut clangd = Command::new("clangd-15")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to start clangd-15");
+
+    let clangd_stdin = clangd.stdin.take().expect("Failed to open clangd stdin");
+    let clangd_stdout = clangd.stdout.take().expect("Failed to open clangd stdout");
+
+    let stdin = io::stdin();
+
+    // Forwarding input to clangd
+    let forward_input_handle = task::spawn(async move {
+        //while(true){
+            forward_input_to_clangd(stdin, clangd_stdin).await;
+        //}
+    });
+
+    // Forwarding clangd output to stdout
+    let forward_output_handle = task::spawn(async move {
+        //while(true){
+            forward_clangd_output_to_stdout(clangd_stdout).await;
+        //}
+    });
+
+
+    // Await both tasks to complete
+    let _ = tokio::try_join!(forward_input_handle, forward_output_handle);
+
+    let message = "End";
+    log_message(&message);
+
+    // Optionally, wait for the clangd process to exit
+    let _ = clangd.wait().await.expect("clangd process encountered an error");
+}
