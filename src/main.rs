@@ -2,6 +2,16 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::{thread};
+use serde::{Serialize, Deserialize};
+use serde_json::Value;
+
+#[derive(Serialize, Deserialize)]
+struct User {
+    method: String,
+    id: u32,
+    // Dynamic part of the structure
+    extra: Value,
+}
 
 fn log_char(character: char, log_filename: &str)  {
     let mut file = OpenOptions::new()
@@ -44,36 +54,43 @@ fn read_message(input_stream: &mut impl BufRead) -> io::Result<String> {
             .expect("Failed to convert content to String");
         header_line.push_str(&content);
 
+        log_message(&header_line, "/tmp/messageslsp.txt");
         return Ok(header_line);
     }
     Ok(String::new())
 }
 
 fn move_input(input_stream: &mut impl BufRead, to_clangd: &mut std::process::ChildStdin){
-    let mut header_line = String::new();
-    if input_stream.read_line(&mut header_line).expect("la") > 0 {
-        let content_length: usize = header_line.trim()
-            .split(':')
-            .nth(1)
-            .expect("Content-Length header not found")
-            .trim()
-            .parse()
-            .expect("Failed to parse content length");
+    //let mut header_line = String::new();
+    //if input_stream.read_line(&mut header_line).expect("la") > 0 {
+    //    let content_length: usize = header_line.trim()
+    //        .split(':')
+    //        .nth(1)
+    //        .expect("Content-Length header not found")
+    //        .trim()
+    //        .parse()
+    //        .expect("Failed to parse content length");
 
-        let mut separator = vec![0; 2]; 
-        let _ = input_stream.read_exact(&mut separator);
-        let separator = String::from_utf8(separator)
-            .expect("Failed to read separator");
-        header_line.push_str(&separator);
+    //    let mut separator = vec![0; 2]; 
+    //    let _ = input_stream.read_exact(&mut separator);
+    //    let separator = String::from_utf8(separator)
+    //        .expect("Failed to read separator");
+    //    header_line.push_str(&separator);
 
-        let mut content = vec![0; content_length];
-        input_stream.read_exact(&mut content).expect("le");
-        let content = String::from_utf8(content)
-            .expect("Failed to convert content to String");
-        header_line.push_str(&content);
-
-        to_clangd.write_all(header_line.as_bytes()).expect("Failed to write");
-    }
+    //    let mut content = vec![0; content_length];
+    //    input_stream.read_exact(&mut content).expect("le");
+    //    let content = String::from_utf8(content)
+    //        .expect("Failed to convert content to String");
+    //    header_line.push_str(&content);
+        match read_message(input_stream) {
+            Ok(response) => {
+                //println!("{}", response);
+                to_clangd.write_all(response.as_bytes()).expect("Fail to write");
+            },
+            Err(e) => eprintln!("Error reading message from clangd: {}", e),
+        }
+        //to_clangd.write_all(header_line.as_bytes()).expect("Failed to write");
+    
 }
 
 fn move_output(from_clangd : &mut BufReader<std::process::ChildStdout>){
