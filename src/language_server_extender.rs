@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write, Result, Error};
 use serde_json::{Value};
 
-type CodeActionMap = Arc<Mutex<HashMap<u32, Option<String>>>>;
+type PendingMessagesMap = Arc<Mutex<HashMap<u64, Option<String>>>>;
+type MessageHandler = Box<dyn Fn(&ParsedMessage) -> std::io::Result<()> + Send>;
+type HandlerMap = Arc<Mutex<HashMap<String, MessageHandler>>>;
 
 fn invalid_data(msg: &str) -> Error
 {
@@ -19,7 +21,8 @@ fn other_error(msg: &str) -> Error
 
 pub struct LanguageServerExtender {
     _language_server: Child,
-    _pending_message_extensions: CodeActionMap,
+    pending_message_extensions: PendingMessagesMap,
+    handlers: HandlerMap,
 
     to_language_server: BufWriter<ChildStdin>,
     from_language_server: BufReader<ChildStdout>,
@@ -29,7 +32,8 @@ pub struct LanguageServerExtender {
 
 pub struct ParsedMessage {
     full_message: String,
-    _method: String,
+    method: String,
+    id: Option<u64>,
     _json_content: serde_json::Value,
 }
 
@@ -54,12 +58,19 @@ impl LanguageServerExtender {
 
         Ok(LanguageServerExtender {
             _language_server: language_server,
-            _pending_message_extensions: Arc::new(Mutex::new(HashMap::new())),
+            pending_message_extensions: Arc::new(Mutex::new(HashMap::new())),
+            handlers: Arc::new(Mutex::new(HashMap::new())),
             to_language_server,
             from_language_server,
             to_ide: BufWriter::new(std::io::stdout()),
             from_ide: BufReader::new(std::io::stdin()),
         })
+    }
+
+    pub fn add_handler(&mut self, method: &str, handler: MessageHandler)
+    {
+        let mut handlers = self.handlers.lock().unwrap();
+        handlers.insert(method.to_string(), handler);
     }
 
     pub fn run(self)
@@ -69,8 +80,10 @@ impl LanguageServerExtender {
 
         let input_thread = thread::spawn(move || {
             loop {
-                if let Err(e) = Self::run_once(&mut from_ide,
-                                               &mut to_language_server) {
+                if let Err(e) = Self::run_input_once(&self.handlers,
+                                                     &self.pending_message_extensions,
+                                                     &mut from_ide,
+                                                     &mut to_language_server) {
                     eprintln!("Error in input thread: {}", e);
                     break;
                 }
@@ -82,8 +95,8 @@ impl LanguageServerExtender {
 
         let output_thread = thread::spawn(move || {
             loop {
-                if let Err(e) = Self::run_once(&mut from_language_server,
-                                               &mut to_ide) {
+                if let Err(e) = Self::run_output_once(&mut from_language_server,
+                                                      &mut to_ide) {
                     eprintln!("Error in output thread: {}", e);
                     break;
                 }
@@ -92,44 +105,43 @@ impl LanguageServerExtender {
 
         input_thread.join().unwrap();
         output_thread.join().unwrap();
-
-        //ensure the process is dead now.
     }
 
-    //fn run_once(read_stream: &mut impl BufRead, write_stream: &mut BufWriter<std::io::Stdout>) -> std::io::Result<()> {
-    //    let response = Self::parse_message(read_stream)?;
-    //    write_stream.write_all(response.full_message.as_bytes())?;
-    //    write_stream.flush()?;
-    //    Ok(())
-    //}
-
-    fn run_once<R: BufRead, W: Write>(read_stream: &mut R, write_stream: &mut W) -> std::io::Result<()> {
+    fn run_input_once<R: BufRead, W: Write>(handlers: &HandlerMap,
+                                            pending_messages: &PendingMessagesMap,
+                                            read_stream: &mut R,
+                                            write_stream: &mut W) -> std::io::Result<()> 
+    {
         let response = Self::parse_message(read_stream)?;
         write_stream.write_all(response.full_message.as_bytes())?;
+
+        {
+            let handlers = handlers.lock().unwrap();
+            if let Some(handler) = handlers.get(&response.method) {
+                let mut pending_messages = pending_messages.lock().unwrap();
+
+                if let Some(id) = &response.id {
+                     pending_messages.entry(*id).or_insert(None);
+                }
+
+                let _ = thread::spawn(move || {
+                    loop {
+                        pending_messages.entry(*id) = handler(response);
+                    }
+                });
+            }
+        }
+
         write_stream.flush()?;
         Ok(())
     }
 
-    fn _run_input_once(&mut self)
+    fn run_output_once<R: BufRead, W: Write>(read_stream: &mut R, write_stream: &mut W) -> std::io::Result<()>
     {
-        match Self::parse_message(&mut self.from_ide) {
-            Ok(response) => {
-                self.to_language_server.write_all(response.full_message.as_bytes())
-                    .expect("Fail to write");
-            },
-            Err(e) => eprintln!("Error reading message from IDE : {}", e),
-        }
-    }
-
-    fn _run_output_once(&mut self)
-    {
-        match Self::parse_message(&mut self.from_language_server) {
-            Ok(response) => {
-                self.to_ide.write_all(response.full_message.as_bytes())
-                    .expect("Fail to write");
-            },
-            Err(e) => eprintln!("Error reading message from language server: {}", e),
-        }
+        let response = Self::parse_message(read_stream)?;
+        write_stream.write_all(response.full_message.as_bytes())?;
+        write_stream.flush()?;
+        Ok(())
     }
 
     fn parse_message(input_stream: &mut impl BufRead) -> Result<ParsedMessage>
@@ -170,9 +182,13 @@ impl LanguageServerExtender {
                 |s|{s.to_string()},
             );
 
+        let id: Option<u64> = parsed_content.get("id")
+            .and_then(Value::as_u64);
+
         return Ok(ParsedMessage {
             full_message: full_message,
-            _method: method,
+            method: method,
+            id: id, 
             _json_content: parsed_content,
         });
     }
