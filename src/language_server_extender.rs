@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write, Result, Error};
 use serde_json::{Value};
 
 type PendingMessagesMap = Arc<Mutex<HashMap<u64, Option<String>>>>;
-type MessageHandler = Box<dyn Fn(&ParsedMessage) -> std::io::Result<()> + Send>;
+type MessageHandler = Box<dyn Fn(&ParsedMessage) -> std::io::Result<String> + Send>;
 type HandlerMap = Arc<Mutex<HashMap<String, MessageHandler>>>;
 
 fn invalid_data(msg: &str) -> Error
@@ -75,13 +75,14 @@ impl LanguageServerExtender {
 
     pub fn run(self)
     {
-        let mut from_ide           = self.from_ide; 
-        let mut to_language_server = self.to_language_server;
+        let mut from_ide            = self.from_ide;
+        let mut to_language_server  = self.to_language_server;
+        let input_message_extensions = Arc::clone(&self.pending_message_extensions);
 
         let input_thread = thread::spawn(move || {
             loop {
                 if let Err(e) = Self::run_input_once(&self.handlers,
-                                                     &self.pending_message_extensions,
+                                                     &input_message_extensions,
                                                      &mut from_ide,
                                                      &mut to_language_server) {
                     eprintln!("Error in input thread: {}", e);
@@ -92,10 +93,12 @@ impl LanguageServerExtender {
 
         let mut from_language_server = self.from_language_server;
         let mut to_ide               = self.to_ide;
+        let output_message_extensions = Arc::clone(&self.pending_message_extensions);
 
         let output_thread = thread::spawn(move || {
             loop {
-                if let Err(e) = Self::run_output_once(&mut from_language_server,
+                if let Err(e) = Self::run_output_once(&output_message_extensions,
+                                                      &mut from_language_server,
                                                       &mut to_ide) {
                     eprintln!("Error in output thread: {}", e);
                     break;
@@ -118,17 +121,16 @@ impl LanguageServerExtender {
         {
             let handlers = handlers.lock().unwrap();
             if let Some(handler) = handlers.get(&response.method) {
-                let mut pending_messages = pending_messages.lock().unwrap();
-
                 if let Some(id) = &response.id {
-                     pending_messages.entry(*id).or_insert(None);
-                }
-
-                let _ = thread::spawn(move || {
-                    loop {
-                        pending_messages.entry(*id) = handler(response);
+                    let handler_result = handler(&response);
+                    match handler_result {
+                        Ok(message) => {
+                            let mut pending_messages = pending_messages.lock().unwrap();
+                            pending_messages.entry(*id).or_insert(Some(message));
+                        },
+                        Err(_) => todo!(),
                     }
-                });
+                }
             }
         }
 
@@ -136,10 +138,24 @@ impl LanguageServerExtender {
         Ok(())
     }
 
-    fn run_output_once<R: BufRead, W: Write>(read_stream: &mut R, write_stream: &mut W) -> std::io::Result<()>
+    fn run_output_once<R: BufRead, W: Write>(pending_messages: &PendingMessagesMap,
+                                             read_stream: &mut R,
+                                             write_stream: &mut W) -> std::io::Result<()>
     {
         let response = Self::parse_message(read_stream)?;
-        write_stream.write_all(response.full_message.as_bytes())?;
+
+        let message_to_write = if let Some(id) = &response.id {
+            pending_messages.lock().unwrap().remove(id)
+                .flatten()
+                .or_else(|| Some(response.full_message.clone()))
+        } else {
+            Some(response.full_message.clone())
+        };
+
+        if let Some(message) = message_to_write {
+            write_stream.write_all(message.as_bytes())?;
+        }
+
         write_stream.flush()?;
         Ok(())
     }

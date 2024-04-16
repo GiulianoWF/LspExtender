@@ -15,5 +15,5 @@ fn main() {
             .expect("Error running server");
         
         server.run();
-    }
+}
 
